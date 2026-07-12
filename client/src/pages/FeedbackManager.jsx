@@ -1,303 +1,381 @@
 // client/src/pages/FeedbackManager.jsx
 import React, { useState, useEffect } from 'react';
+import { useAuth } from '../context/AuthContext';
 import api from '../axiosInstance';
 
-/**
- * Robust FeedbackManager:
- * - Tries multiple endpoints for students and faculty to handle backend shape differences.
- * - Gracefully handles 400/500 and shows friendly UI messages.
- */
+const teal = '#2dd4bf';
+const navy = '#0f2a3d';
+const green = '#10b981';
+const rose = '#f43f5e';
+const amber = '#f59e0b';
 
-function normalizeList(resp) {
-  if (!resp) return [];
-  const d = resp.data ?? {};
-  if (Array.isArray(d)) return d;
-  if (Array.isArray(d.students)) return d.students;
-  if (Array.isArray(d.users)) return d.users;
-  if (Array.isArray(d.faculty)) return d.faculty;
-  if (Array.isArray(d.rows)) return d.rows;
-  if (Array.isArray(d.results)) return d.results;
-  return [];
+function getSentimentColor(s) {
+  if (!s) return '#64748b';
+  if (s.toLowerCase() === 'positive') return green;
+  if (s.toLowerCase() === 'negative') return rose;
+  return amber;
 }
 
-async function fetchFeedbackOnly() {
-  try {
-    const resp = await api.get('/feedback', { params: {} });
-    const list = Array.isArray(resp.data?.feedback) ? resp.data.feedback : (Array.isArray(resp.data) ? resp.data : []);
-    setFeedbackList(list);
-    return true;
-  } catch (err) {
-    console.warn('[FeedbackManager] /feedback failed', err?.response?.status, err?.response?.data || err?.message);
-    // if backend needs teacher_id, do nothing — we'll keep list empty but won't crash
-    return false;
-  }
+function StarRating({ score, onSelect, readonly }) {
+  const [hover, setHover] = useState(0);
+  return (
+    <div style={{ display: 'flex', gap: 6 }}>
+      {[1, 2, 3, 4, 5].map(star => (
+        <span
+          key={star}
+          onClick={() => { if (!readonly && onSelect) onSelect(star); }}
+          onMouseEnter={() => { if (!readonly) setHover(star); }}
+          onMouseLeave={() => { if (!readonly) setHover(0); }}
+          style={{
+            fontSize: readonly ? 18 : 36,
+            cursor: readonly ? 'default' : 'pointer',
+            color: star <= (hover || score) ? '#fbbf24' : '#e5e7eb',
+            transition: 'all 0.15s',
+            transform: (!readonly && star <= hover) ? 'scale(1.15)' : 'scale(1)'
+          }}
+        >★</span>
+      ))}
+    </div>
+  );
 }
 
 export default function FeedbackManager() {
-  const [students, setStudents] = useState([]);
+  const { user } = useAuth();
+  const role = (user?.role || 'student').toLowerCase();
+
   const [faculty, setFaculty] = useState([]);
-  const [feedbackList, setFeedbackList] = useState([]);
-  const [newFeedback, setNewFeedback] = useState({
-    student_id: '',
-    faculty_id: '',
-    text_content: ''
-  });
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+  const [selectedFaculty, setSelectedFaculty] = useState('');
+  const [rating, setRating] = useState(0);
+  const [comment, setComment] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [submitSuccess, setSubmitSuccess] = useState(false);
+  const [error, setError] = useState('');
 
-  // Try a set of endpoints in order and return first successful non-empty array
-  async function tryEndpointsForList(endpoints) {
-    for (const ep of endpoints) {
-      try {
-        const resp = await api.get(ep.url, { params: ep.params || {} });
-        const list = normalizeList(resp);
-        // accept any truthy array (can be empty too - but still valid)
-        return { ok: true, data: list, raw: resp.data };
-      } catch (err) {
-        // Log details, but continue to next candidate
-        console.warn(`[FeedbackManager] endpoint ${ep.url} failed`, err?.response?.status, err?.response?.data || err.message);
-      }
-    }
-    return { ok: false, data: [] };
-  }
-
-  async function fetchData() {
-    setLoading(true);
-    setError(null);
-
-    // STUDENTS — try multiple common endpoints
-    try {
-      const studentCandidates = [
-        { url: '/students' },
-        { url: '/api/students' }, // axiosInstance will prefix /api, but trying just in case
-        { url: '/users', params: { roles: 'student' } },
-        { url: '/users', params: { role: 'student' } },
-        { url: '/admin/students' },
-      ];
-      const sres = await tryEndpointsForList(studentCandidates);
-      if (sres.ok) setStudents(sres.data);
-      else setStudents([]); // empty if nothing found
-    } catch (e) {
-      console.error("Failed to load students", e);
-      setStudents([]);
-    }
-
-    // FACULTY — try multiple endpoints
-    try {
-      const facCandidates = [
-        { url: '/users', params: { roles: 'faculty' } },
-        { url: '/users', params: { role: 'faculty' } },
-        { url: '/faculty' },
-        { url: '/admin/faculty' }
-      ];
-      const fres = await tryEndpointsForList(facCandidates);
-      if (fres.ok) setFaculty(fres.data);
-      else setFaculty([]);
-    } catch (e) {
-      console.error("Failed to load faculty", e);
-      setFaculty([]);
-    }
-
-    // FEEDBACK — try to retrieve aggregated feedback; backend may require teacher_id
-    try {
-      // Try 1: try fetching all feedback (management view)
-      try {
-        const fb1 = await api.get('/feedback');
-        setFeedbackList(Array.isArray(fb1.data?.feedback) ? fb1.data.feedback : (Array.isArray(fb1.data) ? fb1.data : []));
-      } catch (err1) {
-        // If 400, backend expects teacher_id; if 500 or other, we try fallback endpoints
-        const status = err1?.response?.status;
-        console.warn('[FeedbackManager] /feedback failed', status, err1?.response?.data || err1.message);
-        if (status === 400) {
-          // backend requires teacher_id — try admin summary or limited fetches
-          try {
-            const fb2 = await api.get('/feedback', { params: { limit: 200 } });
-            setFeedbackList(Array.isArray(fb2.data?.feedback) ? fb2.data.feedback : (Array.isArray(fb2.data) ? fb2.data : []));
-          } catch (err2) {
-            // try admin/fallback endpoints
-            try {
-              const fb3 = await api.get('/admin/feedback');
-              setFeedbackList(normalizeList(fb3));
-            } catch (err3) {
-              console.warn('[FeedbackManager] all feedback endpoints failed', err3?.response?.status, err3?.response?.data);
-              setFeedbackList([]);
-            }
-          }
-        } else {
-          // status 500 or other: try admin/alternate endpoints
-          try {
-            const fbAlt = await api.get('/admin/feedback');
-            setFeedbackList(normalizeList(fbAlt));
-          } catch (errAlt) {
-            console.warn('[FeedbackManager] fallback feedback endpoints failed', errAlt?.response?.data || errAlt.message);
-            setFeedbackList([]);
-          }
-        }
-      }
-    } catch (e) {
-      console.error("Unexpected error while loading feedback", e);
-      setFeedbackList([]);
-    } finally {
-      setLoading(false);
-    }
-  }
+  const [allFeedback, setAllFeedback] = useState([]);
+  const [myFeedback, setMyFeedback] = useState([]);
+  const [loadingFeedback, setLoadingFeedback] = useState(false);
 
   useEffect(() => {
-    fetchData();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    loadFaculty();
+    if (role === 'faculty') loadMyFeedback();
+    if (role === 'admin' || role === 'management') loadAllFeedback();
+  }, [role]);
 
-  const handleChange = (e) => {
-    setNewFeedback({ ...newFeedback, [e.target.name]: e.target.value });
-  };
-
-  const handleSubmit = async (e) => {
-  e.preventDefault();
-  setError(null);
-  if (!newFeedback.student_id || !newFeedback.faculty_id || !newFeedback.text_content) {
-    setError('Please select student, faculty and write feedback text.');
-    return;
+  async function loadFaculty() {
+    try {
+      const res = await api.get('/api/users', { params: { roles: 'faculty' } });
+      const arr = Array.isArray(res.data) ? res.data : (res.data.users || []);
+      setFaculty(arr);
+    } catch (e) { console.error('Failed to load faculty', e); }
   }
 
-  try {
-    // --- PAYLOAD: try two naming shapes because backends differ often ---
-    const payloadVariants = [
-      // variant A — earlier shape we used (sender_user_id etc.)
-      {
-        sender_user_id: newFeedback.student_id,
-        receiver_user_id: newFeedback.faculty_id,
-        comment: newFeedback.text_content,
-        score: newFeedback.score ?? 5
-      },
-      // variant B — some backends expect student_id / faculty_id / text
-      {
-        student_id: newFeedback.student_id,
-        faculty_id: newFeedback.faculty_id,
-        text: newFeedback.text_content
-      }
-    ];
-
-    let posted = false;
-    for (const payload of payloadVariants) {
-      try {
-        const res = await api.post('/feedback', payload);
-        console.info('[FeedbackManager] posted feedback ok', res?.status);
-        posted = true;
-        break;
-      } catch (err) {
-        console.warn('[FeedbackManager] POST /feedback failed for payload shape', err?.response?.status, err?.response?.data || err?.message);
-        // try next payload shape
-      }
-    }
-
-    if (!posted) {
-      throw new Error('All POST attempts failed; check backend expected payload fields.');
-    }
-
-    // only refresh feedback list (not students)
-    await fetchFeedbackOnly();
-
-    setNewFeedback({ student_id: '', faculty_id: '', text_content: '' });
-  } catch (err) {
-    console.error('Submission error', err);
-    setError(err?.response?.data?.error || err?.message || 'Failed to submit feedback');
+  async function loadMyFeedback() {
+    if (!user) return;
+    setLoadingFeedback(true);
+    try {
+      const res = await api.get('/api/feedback', { params: { teacher_id: user.user_id } });
+      const arr = res.data.feedback || res.data || [];
+      setMyFeedback(Array.isArray(arr) ? arr : []);
+    } catch (e) { console.error('Failed to load feedback', e); }
+    finally { setLoadingFeedback(false); }
   }
-};
 
-  if (loading) return <div className="p-8 text-center text-blue-500">Loading required data...</div>;
+  async function loadAllFeedback() {
+    setLoadingFeedback(true);
+    try {
+      const res = await api.get('/api/feedback/all');
+      const arr = res.data.feedback || [];
+      setAllFeedback(Array.isArray(arr) ? arr : []);
+    } catch (e) { console.error('Failed to load all feedback', e); }
+    finally { setLoadingFeedback(false); }
+  }
 
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setError('');
+    if (!selectedFaculty) return setError('Please select a faculty member.');
+    if (rating === 0) return setError('Please give a star rating.');
+    if (!comment.trim()) return setError('Please write your feedback comment.');
+
+    setSubmitting(true);
+    try {
+      await api.post('/api/feedback', {
+        receiver_user_id: parseInt(selectedFaculty),
+        score: rating,
+        comment: comment.trim()
+      });
+      setSubmitSuccess(true);
+      setSelectedFaculty(''); setRating(0); setComment('');
+      setTimeout(() => setSubmitSuccess(false), 4000);
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to submit feedback. Please try again.');
+    } finally { setSubmitting(false); }
+  }
+
+  // ---- STUDENT VIEW ----
+  if (role === 'student') {
+    return (
+      <div style={{ padding: 28, background: '#f8fafc', minHeight: '100vh' }}>
+        <div style={{ marginBottom: 28 }}>
+          <h1 style={{ fontSize: 28, fontWeight: 700, color: navy, margin: '0 0 6px 0' }}>
+            💬 Submit Feedback
+          </h1>
+          <p style={{ color: '#64748b', fontSize: 14, margin: 0 }}>
+            Your feedback is completely anonymous. Faculty will never see your name.
+          </p>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: 24, alignItems: 'start' }}>
+          {/* Form Card */}
+          <div style={{ background: '#fff', borderRadius: 16, padding: 32, boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
+            <h2 style={{ fontSize: 20, fontWeight: 700, color: navy, margin: '0 0 24px 0' }}>
+              ✍️ Submit Anonymous Feedback
+            </h2>
+
+            {submitSuccess && (
+              <div style={{ padding: 16, background: '#f0fff8', border: '2px solid ' + teal, borderRadius: 12, marginBottom: 24, color: '#065f46' }}>
+                <div style={{ fontWeight: 700, fontSize: 16 }}>✅ Feedback Submitted!</div>
+                <div style={{ fontSize: 14, marginTop: 4 }}>Your anonymous feedback has been submitted. Thank you!</div>
+              </div>
+            )}
+
+            {error && (
+              <div style={{ padding: 14, background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 10, marginBottom: 20, color: '#dc2626', fontSize: 14 }}>
+                ⚠️ {error}
+              </div>
+            )}
+
+            <form onSubmit={handleSubmit}>
+              <div style={{ marginBottom: 24 }}>
+                <label style={{ display: 'block', fontSize: 14, fontWeight: 600, color: navy, marginBottom: 8 }}>
+                  Select Faculty Member *
+                </label>
+                <select
+                  value={selectedFaculty}
+                  onChange={e => { setSelectedFaculty(e.target.value); setError(''); }}
+                  style={{ width: '100%', padding: '14px 16px', borderRadius: 10, border: '2px solid #e2e8f0', fontSize: 15, background: '#fff', color: navy, outline: 'none', cursor: 'pointer', boxSizing: 'border-box' }}
+                >
+                  <option value="">-- Select Faculty --</option>
+                  {faculty.map(f => (
+                    <option key={f.user_id} value={f.user_id}>
+                      {f.display_name || f.email}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div style={{ marginBottom: 24 }}>
+                <label style={{ display: 'block', fontSize: 14, fontWeight: 600, color: navy, marginBottom: 12 }}>
+                  Your Rating *
+                </label>
+                <div style={{ padding: 16, background: '#f8fafc', borderRadius: 12, display: 'inline-block' }}>
+                  <StarRating score={rating} onSelect={setRating} readonly={false} />
+                </div>
+                {rating > 0 && (
+                  <div style={{ marginTop: 10, fontSize: 14, color: teal, fontWeight: 600 }}>
+                    {rating}/5 — {rating === 5 ? 'Excellent!' : rating === 4 ? 'Very Good!' : rating === 3 ? 'Good' : rating === 2 ? 'Fair' : 'Poor'}
+                  </div>
+                )}
+              </div>
+
+              <div style={{ marginBottom: 24 }}>
+                <label style={{ display: 'block', fontSize: 14, fontWeight: 600, color: navy, marginBottom: 8 }}>
+                  Your Feedback *
+                </label>
+                <textarea
+                  value={comment}
+                  onChange={e => { setComment(e.target.value); setError(''); }}
+                  placeholder="e.g. The lecturer explained concepts clearly and was always helpful..."
+                  rows={5} maxLength={500}
+                  style={{ width: '100%', padding: '14px 16px', borderRadius: 10, border: '2px solid #e2e8f0', fontSize: 15, resize: 'vertical', fontFamily: 'inherit', outline: 'none', boxSizing: 'border-box', lineHeight: 1.6 }}
+                />
+                <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 6 }}>
+                  {comment.length}/500 characters • Your identity stays anonymous
+                </div>
+              </div>
+
+              <button
+                type="submit" disabled={submitting}
+                style={{ width: '100%', padding: 16, background: submitting ? '#94a3b8' : 'linear-gradient(135deg, #2dd4bf, #0d9488)', color: '#fff', border: 'none', borderRadius: 12, fontSize: 16, fontWeight: 700, cursor: submitting ? 'not-allowed' : 'pointer', boxShadow: '0 4px 12px rgba(45,212,191,0.3)' }}
+              >
+                {submitting ? '⏳ Submitting...' : '📨 Submit Anonymous Feedback'}
+              </button>
+            </form>
+          </div>
+
+          {/* Info Panel */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <div style={{ background: '#fff', borderRadius: 14, padding: 20, boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
+              <h3 style={{ fontSize: 15, fontWeight: 700, color: navy, margin: '0 0 16px 0' }}>🔐 Your Privacy is Protected</h3>
+              {[
+                { icon: '👤', text: 'Your name is never shown to faculty' },
+                { icon: '🔒', text: 'Even management cannot see who submitted' },
+                { icon: '🤖', text: 'AI sentiment analysis runs automatically' },
+                { icon: '📊', text: 'Helps improve teaching quality institution-wide' },
+              ].map((item, i) => (
+                <div key={i} style={{ display: 'flex', gap: 10, marginBottom: 12, alignItems: 'flex-start' }}>
+                  <span style={{ fontSize: 18 }}>{item.icon}</span>
+                  <span style={{ fontSize: 13, color: '#475569', lineHeight: 1.5 }}>{item.text}</span>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ background: 'linear-gradient(135deg, #0f2a3d, #1a3f5c)', borderRadius: 14, padding: 20, color: '#fff' }}>
+              <h3 style={{ fontSize: 15, fontWeight: 700, margin: '0 0 10px 0' }}>🤖 Sentiment Analysis</h3>
+              <p style={{ fontSize: 13, color: '#cbd5e1', lineHeight: 1.6, margin: 0 }}>
+                Your feedback is automatically analyzed using Python VADER NLP to detect whether it is Positive, Neutral, or Negative.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- FACULTY VIEW ----
+  if (role === 'faculty') {
+    return (
+      <div style={{ padding: 28, background: '#f8fafc', minHeight: '100vh' }}>
+        <div style={{ marginBottom: 28 }}>
+          <h1 style={{ fontSize: 28, fontWeight: 700, color: navy, margin: '0 0 6px 0' }}>📊 My Feedback</h1>
+          <p style={{ color: '#64748b', fontSize: 14, margin: 0 }}>
+            Anonymous feedback from your students. Student identities are hidden.
+          </p>
+        </div>
+
+        {loadingFeedback && (
+          <div style={{ textAlign: 'center', padding: '60px 20px' }}>
+            <div style={{ fontSize: 36, marginBottom: 12 }}>📊</div>
+            <div style={{ color: '#64748b' }}>Loading your feedback...</div>
+          </div>
+        )}
+
+        {!loadingFeedback && myFeedback.length === 0 && (
+          <div style={{ background: '#fff', borderRadius: 14, padding: '60px 20px', textAlign: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
+            <div style={{ fontSize: 60, marginBottom: 16 }}>📭</div>
+            <h3 style={{ color: navy, marginBottom: 8 }}>No Feedback Yet</h3>
+            <p style={{ color: '#64748b' }}>Students have not submitted feedback for you yet.</p>
+          </div>
+        )}
+
+        {!loadingFeedback && myFeedback.length > 0 && (
+          <div>
+            {/* Summary Cards */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 16, marginBottom: 24 }}>
+              {[
+                { label: 'Total Feedback', value: myFeedback.length, color: teal },
+                { label: 'Avg Rating', value: (myFeedback.reduce((s, f) => s + (Number(f.score) || 0), 0) / myFeedback.length).toFixed(1), color: amber },
+                { label: 'Positive', value: myFeedback.filter(f => f.sentiment?.toLowerCase() === 'positive').length, color: green },
+                { label: 'Negative', value: myFeedback.filter(f => f.sentiment?.toLowerCase() === 'negative').length, color: rose },
+              ].map((card, i) => (
+                <div key={i} style={{ background: '#fff', borderRadius: 12, padding: 20, textAlign: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.06)', borderTop: `4px solid ${card.color}` }}>
+                  <div style={{ fontSize: 28, fontWeight: 700, color: navy }}>{card.value}</div>
+                  <div style={{ fontSize: 12, color: '#64748b', marginTop: 4, fontWeight: 600 }}>{card.label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Feedback List — NO sender name shown */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              {myFeedback.map((f, i) => (
+                <div key={f.id || i} style={{ background: '#fff', borderRadius: 12, padding: 20, boxShadow: '0 2px 8px rgba(0,0,0,0.06)', borderLeft: '4px solid ' + getSentimentColor(f.sentiment) }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
+                    <StarRating score={f.score || 0} readonly={true} />
+                    {f.sentiment && (
+                      <span style={{ padding: '4px 12px', borderRadius: 20, fontSize: 12, fontWeight: 700, background: getSentimentColor(f.sentiment) + '20', color: getSentimentColor(f.sentiment) }}>
+                        {f.sentiment}
+                      </span>
+                    )}
+                  </div>
+                  <p style={{ fontSize: 14, color: '#475569', lineHeight: 1.7, fontStyle: 'italic', margin: '0 0 10px 0' }}>
+                    "{f.comment || 'No comment provided'}"
+                  </p>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: '#94a3b8' }}>
+                    {/* ✅ Anonymous — no student name */}
+                    <span>🔒 Anonymous Student</span>
+                    <span>{f.created_on ? new Date(f.created_on).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : ''}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ---- ADMIN/MANAGEMENT VIEW ----
   return (
-    <div className="container mx-auto p-8 bg-gray-50 min-h-screen">
-      <h1 className="text-3xl font-extrabold text-gray-800 mb-8 border-b pb-2">Student Feedback Portal</h1>
+    <div style={{ padding: 28, background: '#f8fafc', minHeight: '100vh' }}>
+      <div style={{ marginBottom: 28 }}>
+        <h1 style={{ fontSize: 28, fontWeight: 700, color: navy, margin: '0 0 6px 0' }}>📊 All Feedback</h1>
+        <p style={{ color: '#64748b', fontSize: 14, margin: 0 }}>
+          Feedback submitted to faculty. Student identities are fully anonymous.
+        </p>
+      </div>
 
-      {error && (
-        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
-          <strong className="font-bold">Error:</strong>
-          <span className="block sm:inline ml-2">{error}</span>
+      {loadingFeedback && (
+        <div style={{ textAlign: 'center', padding: '60px 20px' }}>
+          <div style={{ fontSize: 36, marginBottom: 12 }}>📊</div>
+          <div style={{ color: '#64748b' }}>Loading all feedback...</div>
         </div>
       )}
 
-      <div className="bg-white p-6 rounded-lg shadow-xl mb-10 border-t-4 border-orange-600">
-        <h2 className="text-xl font-semibold text-gray-700 mb-4">Submit Confidential Feedback</h2>
-        <form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
-
-          {/* Student Selector */}
-          <div className="col-span-1">
-            <label className="block text-sm font-medium text-gray-700 mb-1">Your Name (Student):</label>
-            <select
-              name="student_id"
-              value={newFeedback.student_id}
-              onChange={handleChange}
-              required
-              className="p-2 border border-gray-300 rounded-md w-full"
-            >
-              <option value="">-- Select Student --</option>
-              {students.map(s => (
-                <option key={s.user_id ?? s.student_id ?? s.id} value={s.user_id ?? s.student_id ?? s.id}>
-                  {s.display_name ?? s.name ?? s.email ?? `Student ${s.user_id ?? s.student_id ?? s.id}`}
-                </option>
-              ))}
-            </select>
-            {students.length === 0 && <div className="text-xs text-gray-500 mt-1">No students found. Check backend route /api/students or /api/users?roles=student.</div>}
-          </div>
-
-          {/* Faculty Selector */}
-          <div className="col-span-1">
-            <label className="block text-sm font-medium text-gray-700 mb-1">Faculty Member:</label>
-            <select
-              name="faculty_id"
-              value={newFeedback.faculty_id}
-              onChange={handleChange}
-              required
-              className="p-2 border border-gray-300 rounded-md w-full"
-            >
-              <option value="">-- Select Faculty --</option>
-              {faculty.map(f => (
-                <option key={f.user_id ?? f.faculty_id ?? f.id} value={f.user_id ?? f.faculty_id ?? f.id}>
-                  {f.display_name ?? f.name ?? f.email ?? `Faculty ${f.user_id ?? f.faculty_id ?? f.id}`}
-                </option>
-              ))}
-            </select>
-            {faculty.length === 0 && <div className="text-xs text-gray-500 mt-1">No faculty found. Check backend route /api/faculty or /api/users?roles=faculty.</div>}
-          </div>
-
-          {/* Text Content */}
-          <div className="col-span-4">
-            <label className="block text-sm font-medium text-gray-700 mb-1">Your Feedback (Required for analysis):</label>
-            <textarea
-              name="text_content"
-              value={newFeedback.text_content}
-              onChange={handleChange}
-              placeholder="Type your feedback here (e.g., 'The lecturer explained the concepts very clearly')"
-              required
-              rows="3"
-              className="p-2 border border-gray-300 rounded-md w-full resize-none"
-            />
-          </div>
-
-          <button type="submit" className="p-2 bg-orange-600 text-white font-medium rounded-md hover:bg-orange-700 transition-colors shadow-lg col-span-4">
-            Submit Feedback for Sentiment Analysis
-          </button>
-        </form>
-      </div>
-
-      <div className="bg-white p-6 rounded-lg shadow-xl">
-        <h2 className="text-xl font-semibold text-gray-700 mb-4">Analysis Results (Management View) ({feedbackList.length})</h2>
-
-        <div className="space-y-4">
-          {feedbackList.map((f) => (
-            <div key={f.id ?? f.feedback_id} className="p-4 border border-gray-200 rounded-lg">
-              <div className="flex justify-between items-center mb-2 border-b pb-2">
-                <div className="text-sm text-gray-600">Submitted by: <span className="font-semibold text-gray-800">{f.sender_name ?? f.student_name ?? f.sender_user_id}</span> to: <span className="font-semibold text-gray-800">{f.receiver_name ?? f.faculty_name ?? f.receiver_user_id}</span></div>
-                <div className={`px-3 py-1 rounded-full text-xs font-bold ${f.sentiment==='Positive' ? 'bg-green-100 text-green-800' : f.sentiment==='Negative' ? 'bg-red-100 text-red-800' : 'bg-yellow-100 text-yellow-800'}`}>{f.sentiment ?? 'Pending'}</div>
-              </div>
-              <p className="text-sm text-gray-700 italic">"{f.comment ?? f.text_content}"</p>
-              <p className="text-xs text-gray-400 mt-2 self-end">Submitted on: {new Date(f.created_on ?? f.submitted_on ?? f.date_submitted ?? Date.now()).toLocaleDateString()}</p>
-            </div>
-          ))}
-          {feedbackList.length === 0 && <p className="text-center text-gray-500 py-6 text-lg">No feedback records found (or backend returned an error). See console for details.</p>}
+      {!loadingFeedback && allFeedback.length === 0 && (
+        <div style={{ background: '#fff', borderRadius: 14, padding: '60px 20px', textAlign: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
+          <div style={{ fontSize: 60, marginBottom: 16 }}>📭</div>
+          <h3 style={{ color: navy, marginBottom: 8 }}>No Feedback Yet</h3>
+          <p style={{ color: '#64748b' }}>No students have submitted feedback yet.</p>
         </div>
-      </div>
+      )}
+
+      {!loadingFeedback && allFeedback.length > 0 && (
+        <div>
+          {/* Summary */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 16, marginBottom: 24 }}>
+            {[
+              { label: 'Total Submissions', value: allFeedback.length, color: teal },
+              { label: 'Avg Rating', value: (allFeedback.reduce((s, f) => s + (Number(f.score) || 0), 0) / allFeedback.length).toFixed(1), color: amber },
+              { label: 'Positive', value: allFeedback.filter(f => f.sentiment?.toLowerCase() === 'positive').length, color: green },
+              { label: 'Negative', value: allFeedback.filter(f => f.sentiment?.toLowerCase() === 'negative').length, color: rose },
+            ].map((card, i) => (
+              <div key={i} style={{ background: '#fff', borderRadius: 12, padding: 20, textAlign: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.06)', borderTop: `4px solid ${card.color}` }}>
+                <div style={{ fontSize: 28, fontWeight: 700, color: navy }}>{card.value}</div>
+                <div style={{ fontSize: 12, color: '#64748b', marginTop: 4, fontWeight: 600 }}>{card.label}</div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {allFeedback.map((f, i) => (
+              <div key={f.id || i} style={{ background: '#fff', borderRadius: 12, padding: 20, boxShadow: '0 2px 8px rgba(0,0,0,0.06)', borderLeft: '4px solid ' + getSentimentColor(f.sentiment) }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
+                  <div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: navy, marginBottom: 6 }}>
+                      {/* ✅ Shows which faculty received it, but NOT who sent it */}
+                      To Faculty: <span style={{ color: teal }}>{f.faculty_name || 'Unknown Faculty'}</span>
+                      {'  •  '}
+                      <span style={{ color: '#94a3b8', fontWeight: 400 }}>🔒 Anonymous Student</span>
+                    </div>
+                    <StarRating score={f.score || 0} readonly={true} />
+                  </div>
+                  {f.sentiment && (
+                    <span style={{ padding: '6px 14px', borderRadius: 20, fontSize: 12, fontWeight: 700, background: getSentimentColor(f.sentiment) + '20', color: getSentimentColor(f.sentiment) }}>
+                      {f.sentiment}
+                    </span>
+                  )}
+                </div>
+                <p style={{ fontSize: 14, color: '#475569', lineHeight: 1.7, fontStyle: 'italic', margin: '0 0 10px 0' }}>
+                  "{f.comment || 'No comment'}"
+                </p>
+                <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                  {f.created_on ? new Date(f.created_on).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : ''}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
